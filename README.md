@@ -86,6 +86,14 @@ Not:
 - Site rate-limit veya bot korumasi uygulayabilir. Gerekirse `--delay 2.0` gibi daha yuksek gecikme kullanin.
 - Tarihsel "ilk 11" bilgisini Transfermarkt mac raporlarindan cekmek isterseniz scraping modulu bu yonde genisletilmeye uygundur, ancak ilk surum mevcut haliyle kadro degeri, ust duzey oyuncu ve sakatlik etkisini takim/sezon baglaminda toplar.
 
+Yeni dogrulama/fail kosullari:
+
+- `scrape_matches` ve `scrape_team_context`, lig+sezon bazinda tablo veya satir sorunlarini `selector_miss`, `blocked`, `no_data` reason code'lariyla `scrape_metadata.json` icindeki `errors[]` alanina yazar.
+- Lig+sezon esik kontrolleri uygulanir (`matches >= 100`, `team_context >= 10`). Esik alti durumlar artik sadece stdout'a yazilmaz; `errors[]` icine `threshold_breach` olarak kaydedilir.
+- Her lig+sezon icin satir sayilari `rows_per_league_season` alaninda tutulur.
+- Betik sonunda `errors[]` bos degilse islem `non-zero exit code` ile biter. Bu durum CI veya otomasyon tarafinda "veri kalitesi/fetch sorunu" olarak yorumlanmalidir.
+- `warnings[]` alani bilgilendirici ama kritik olmayan durumlar icin ayrilmistir (su an bos gelebilir).
+
 ## 2. Veri hazirlama
 
 ```bash
