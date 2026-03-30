@@ -435,18 +435,11 @@ class TransfermarktScraper:
             ),
             "lxml",
         )
-        injuries_soup = BeautifulSoup(
-            self.fetch_html(
-                injuries_url,
-                expected_selector="table.items",
-                league_key=league_key,
-                season_start_year=season_start_year,
-            ),
-            "lxml",
-        )
+        injuries_soup = self.soup(injuries_url, params={"saison_id": season_start_year})
         venue_soup = BeautifulSoup(
             self.fetch_html(
                 venue_url,
+                params={"saison_id": season_start_year},
                 league_key=league_key,
                 season_start_year=season_start_year,
             ),
@@ -460,6 +453,7 @@ class TransfermarktScraper:
         return {
             "season": f"{season_start_year}/{season_start_year + 1}",
             "season_start_year": season_start_year,
+            "data_reference_season": f"{season_start_year}/{season_start_year + 1}",
             "league_key": self._league_key(league),
             "team_name": team_name,
             "squad_market_value_eur": self._extract_market_value(squad_soup),
