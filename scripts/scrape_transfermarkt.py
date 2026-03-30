@@ -19,6 +19,24 @@ from tqdm import tqdm
 from urllib3.util.retry import Retry
 
 BASE_URL = "https://www.transfermarkt.com"
+SELECTOR_CONFIG = {
+    "selector_version": "v1_primary_fallback",
+    "matches_table": [
+        "table.items",
+        "div.responsive-table table.items",
+        "div.box table.items",
+        "main table.items",
+    ],
+    "match_rows": [
+        "tbody tr",
+        "tr",
+    ],
+    "team_links": [
+        "td.hauptlink a[title]",
+        "a[href*='/verein/'][title]",
+        "a[href*='/verein/']",
+    ],
+}
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -70,6 +88,7 @@ class TransfermarktScraper:
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.debug_dir = Path(debug_dir)
+        self.parse_warnings: list[dict] = []
 
         retry_strategy = Retry(
             total=max_retries,
@@ -187,7 +206,42 @@ class TransfermarktScraper:
             return "selector_miss"
         return "no_data"
 
-    def scrape_matches(self, league: League, season_start_year: int) -> tuple[list[dict], str | None]:
+    @staticmethod
+    def _select_first(soup: BeautifulSoup, selectors: list[str]) -> tuple[BeautifulSoup | None, str | None, bool]:
+        for index, selector in enumerate(selectors):
+            match = soup.select_one(selector)
+            if match is not None:
+                return match, selector, index > 0
+        return None, None, False
+
+    @staticmethod
+    def _normalize_team_name(raw_name: str | None, href: str | None) -> str | None:
+        cleaned = TransfermarktScraper._clean_text(raw_name)
+        if cleaned:
+            return cleaned
+        if not href:
+            return None
+        parts = [part for part in href.split("/") if part]
+        if not parts:
+            return None
+        slug = next((part for part in parts if part != "verein"), parts[-1])
+        normalized = re.sub(r"[-_]+", " ", slug).strip()
+        return TransfermarktScraper._clean_text(normalized.title())
+
+    def _record_parse_warning(self, *, dataset: str, league_key: str, season_start_year: int, message: str, strategy_used: str) -> None:
+        self.parse_warnings.append(
+            {
+                "type": "selector_fallback",
+                "dataset": dataset,
+                "league_key": league_key,
+                "season": f"{season_start_year}/{season_start_year + 1}",
+                "selector_version": SELECTOR_CONFIG["selector_version"],
+                "strategy_used": strategy_used,
+                "message": message,
+            }
+        )
+
+    def scrape_matches(self, league: League, season_start_year: int) -> tuple[list[dict], str | None, dict]:
         url = f"{BASE_URL}/{league.slug}/gesamtspielplan/wettbewerb/{league.code}"
         html = self.fetch_html(
             url,
@@ -197,13 +251,38 @@ class TransfermarktScraper:
             season_start_year=season_start_year,
         )
         soup = BeautifulSoup(html, "lxml")
-        table = soup.find("table", {"class": "items"})
+        table, table_strategy, used_table_fallback = self._select_first(soup, SELECTOR_CONFIG["matches_table"])
+        parse_metadata = {
+            "selector_version": SELECTOR_CONFIG["selector_version"],
+            "strategy_used": {
+                "table_selector": table_strategy,
+                "row_selector": None,
+            },
+        }
         records: list[dict] = []
 
         if not table:
-            return records, self._detect_reason_code(table, 0, html)
+            return records, "selector_strategy_exhausted_matches_table", parse_metadata
 
-        for row in table.select("tbody tr"):
+        if used_table_fallback and table_strategy is not None:
+            self._record_parse_warning(
+                dataset="matches",
+                league_key=self._league_key(league),
+                season_start_year=season_start_year,
+                message="Primary match table selector failed, fallback selector used.",
+                strategy_used=table_strategy,
+            )
+
+        row_selector = None
+        rows = []
+        for candidate in SELECTOR_CONFIG["match_rows"]:
+            rows = table.select(candidate)
+            if rows:
+                row_selector = candidate
+                break
+        parse_metadata["strategy_used"]["row_selector"] = row_selector
+
+        for row in rows:
             row_data = self._extract_match_row_data(row, season_start_year)
             if row_data is None:
                 continue
@@ -222,9 +301,11 @@ class TransfermarktScraper:
                     "away_goals": away_goals,
                     "attendance": attendance,
                     "stadium": stadium,
+                    "selector_version": SELECTOR_CONFIG["selector_version"],
+                    "strategy_used": json.dumps(parse_metadata["strategy_used"], ensure_ascii=False),
                 }
             )
-        return records, self._detect_reason_code(table, len(records), html)
+        return records, self._detect_reason_code(table, len(records), html), parse_metadata
 
     def _extract_match_row_data(self, row: BeautifulSoup, season_start_year: int) -> tuple[str, str, int, int, datetime, int | None, str | None] | None:
         text_cells = [self._clean_text(td.get_text(" ", strip=True)) for td in row.find_all("td")]
@@ -258,7 +339,7 @@ class TransfermarktScraper:
         stadium = self._extract_stadium(row)
         return home_team, away_team, home_goals, away_goals, match_date, attendance, stadium
 
-    def scrape_team_context(self, league: League, season_start_year: int) -> tuple[list[dict], str | None]:
+    def scrape_team_context(self, league: League, season_start_year: int) -> tuple[list[dict], str | None, dict]:
         league_key = self._league_key(league)
         html = self.fetch_html(
             league.competition_url,
@@ -268,15 +349,54 @@ class TransfermarktScraper:
             season_start_year=season_start_year,
         )
         soup = BeautifulSoup(html, "lxml")
-        table = soup.find("table", {"class": "items"})
-        links = soup.select("td.hauptlink a[title]")
+        table, table_strategy, used_table_fallback = self._select_first(soup, SELECTOR_CONFIG["matches_table"])
+        parse_metadata = {
+            "selector_version": SELECTOR_CONFIG["selector_version"],
+            "strategy_used": {
+                "table_selector": table_strategy,
+                "team_link_selector": None,
+            },
+        }
+
+        if used_table_fallback and table_strategy is not None:
+            self._record_parse_warning(
+                dataset="team_context",
+                league_key=league_key,
+                season_start_year=season_start_year,
+                message="Primary team-context table selector failed, fallback selector used.",
+                strategy_used=table_strategy,
+            )
+
         team_pages: dict[str, str] = {}
-        for link in links:
-            href = link.get("href")
-            title = self._clean_text(link.get("title"))
-            if not href or not title or "/verein/" not in href:
-                continue
-            team_pages[title] = urljoin(BASE_URL, href)
+        used_link_selector = None
+        for link_selector in SELECTOR_CONFIG["team_links"]:
+            links = soup.select(link_selector)
+            local_team_pages: dict[str, str] = {}
+            for link in links:
+                href = link.get("href")
+                if not href or "/verein/" not in href:
+                    continue
+                team_name = self._normalize_team_name(link.get("title") or link.get_text(" ", strip=True), href)
+                if not team_name:
+                    continue
+                local_team_pages[team_name] = urljoin(BASE_URL, href)
+            if local_team_pages:
+                team_pages = local_team_pages
+                used_link_selector = link_selector
+                break
+        parse_metadata["strategy_used"]["team_link_selector"] = used_link_selector
+
+        if not team_pages:
+            return [], "selector_strategy_exhausted_team_links", parse_metadata
+
+        if used_link_selector and used_link_selector != SELECTOR_CONFIG["team_links"][0]:
+            self._record_parse_warning(
+                dataset="team_context",
+                league_key=league_key,
+                season_start_year=season_start_year,
+                message="Primary team link selector failed, fallback URL-pattern selector used.",
+                strategy_used=used_link_selector,
+            )
 
         contexts: list[dict] = []
         for team_name, team_url in tqdm(team_pages.items(), desc=f"{league.name} squads", leave=False):
@@ -287,9 +407,10 @@ class TransfermarktScraper:
                     team_name,
                     team_url,
                     league_key=league_key,
+                    parse_metadata=parse_metadata,
                 )
             )
-        return contexts, self._detect_reason_code(table, len(contexts), html)
+        return contexts, self._detect_reason_code(table, len(contexts), html), parse_metadata
 
     def _scrape_single_team_context(
         self,
@@ -298,6 +419,7 @@ class TransfermarktScraper:
         team_name: str,
         team_url: str,
         league_key: str,
+        parse_metadata: dict,
     ) -> dict:
         squad_url = team_url.replace("/startseite/", "/kader/") if "/startseite/" in team_url else team_url
         injuries_url = team_url.replace("/startseite/", "/verletzungen/") if "/startseite/" in team_url else team_url
@@ -345,6 +467,8 @@ class TransfermarktScraper:
             "injured_players": injured_players,
             "injured_top_player_count": len(injured_top_players),
             "stadium_capacity": self._extract_stadium_capacity(venue_soup),
+            "selector_version": SELECTOR_CONFIG["selector_version"],
+            "strategy_used": json.dumps(parse_metadata.get("strategy_used", {}), ensure_ascii=False),
         }
 
     def _extract_market_value(self, soup: BeautifulSoup) -> float | None:
@@ -519,8 +643,8 @@ def main() -> None:
             print(f"Scraping {league.name} {season_start_year}/{season_start_year + 1}")
             season_label = f"{season_start_year}/{season_start_year + 1}"
             try:
-                match_records, match_reason = scraper.scrape_matches(league, season_start_year)
-                team_context_records, team_reason = scraper.scrape_team_context(league, season_start_year)
+                match_records, match_reason, match_parse_metadata = scraper.scrape_matches(league, season_start_year)
+                team_context_records, team_reason, team_parse_metadata = scraper.scrape_team_context(league, season_start_year)
 
                 all_matches.extend(match_records)
                 all_team_context.extend(team_context_records)
@@ -532,6 +656,10 @@ def main() -> None:
                         "season": season_label,
                         "matches": len(match_records),
                         "team_context": len(team_context_records),
+                        "parse_metadata": {
+                            "matches": match_parse_metadata,
+                            "team_context": team_parse_metadata,
+                        },
                     }
                 )
 
@@ -591,6 +719,10 @@ def main() -> None:
                         "message": str(exc),
                     }
                 )
+            finally:
+                if scraper.parse_warnings:
+                    warnings.extend(scraper.parse_warnings)
+                    scraper.parse_warnings = []
 
     match_columns = [
         "season",
@@ -605,6 +737,8 @@ def main() -> None:
         "away_goals",
         "attendance",
         "stadium",
+        "selector_version",
+        "strategy_used",
     ]
     team_columns = [
         "season",
@@ -616,6 +750,8 @@ def main() -> None:
         "injured_players",
         "injured_top_player_count",
         "stadium_capacity",
+        "selector_version",
+        "strategy_used",
     ]
 
     matches_df = pd.DataFrame(all_matches)
