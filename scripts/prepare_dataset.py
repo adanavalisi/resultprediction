@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from pandas.errors import EmptyDataError
 
 TARGET_MAP = {"H": 0, "D": 1, "A": 2}
 
@@ -23,6 +24,16 @@ def safe_literal(value: object) -> list[dict] | list[str]:
         return []
     if isinstance(value, list):
         return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
     try:
         return ast.literal_eval(str(value))
     except (SyntaxError, ValueError):
@@ -65,11 +76,11 @@ def add_rolling_features(team_rows: pd.DataFrame) -> pd.DataFrame:
             lambda values: float(np.dot(values, weighted[-len(values) :]) / weighted[-len(values) :].sum()),
             raw=True,
         )
-        group["form_points_last_10"] = prior["points"].rolling(10).mean()
-        group["goals_for_last_5"] = prior["goals_for"].rolling(5).mean()
-        group["goals_against_last_5"] = prior["goals_against"].rolling(5).mean()
-        group["goal_diff_last_10"] = prior["goal_diff"].rolling(10).mean()
-        group["wins_last_5"] = prior["points"].rolling(5).apply(lambda values: float(np.sum(values == 3)), raw=True)
+        group["form_points_last_10"] = prior["points"].rolling(10, min_periods=3).mean()
+        group["goals_for_last_5"] = prior["goals_for"].rolling(5, min_periods=2).mean()
+        group["goals_against_last_5"] = prior["goals_against"].rolling(5, min_periods=2).mean()
+        group["goal_diff_last_10"] = prior["goal_diff"].rolling(10, min_periods=3).mean()
+        group["wins_last_5"] = prior["points"].rolling(5, min_periods=2).apply(lambda values: float(np.sum(values == 3)), raw=True)
         return group
 
     return team_rows.groupby(["league_key", "team"], group_keys=False).apply(transform)
@@ -137,8 +148,18 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    matches = pd.read_csv(raw_dir / "matches.csv")
+    try:
+        matches = pd.read_csv(raw_dir / "matches.csv")
+    except EmptyDataError as exc:
+        raise ValueError(
+            "matches.csv has no usable columns/rows. First fix scraping (scripts/scrape_transfermarkt.py) and rerun it."
+        ) from exc
     team_context = pd.read_csv(raw_dir / "team_context.csv")
+
+    if matches.empty:
+        raise ValueError(
+            "matches.csv is empty. First fix the scraping step (scripts/scrape_transfermarkt.py) and rerun scraping."
+        )
 
     matches["match_date"] = pd.to_datetime(matches["match_date"], utc=False)
     matches["home_goals"] = pd.to_numeric(matches["home_goals"], errors="coerce")
@@ -209,7 +230,8 @@ def main() -> None:
 
     dataset = dataset.sort_values("match_date").reset_index(drop=True)
     dataset[feature_columns] = dataset[feature_columns].replace([np.inf, -np.inf], np.nan)
-    dataset[feature_columns] = dataset[feature_columns].fillna(dataset[feature_columns].median(numeric_only=True))
+    medians = dataset[feature_columns].median(numeric_only=True)
+    dataset[feature_columns] = dataset[feature_columns].fillna(medians).fillna(0.0)
 
     dataset_path = out_dir / "training_dataset.parquet"
     features_path = out_dir / "feature_columns.json"

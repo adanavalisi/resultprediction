@@ -13,7 +13,6 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from io import StringIO
 
 BASE_URL = "https://www.transfermarkt.com"
 DEFAULT_HEADERS = {
@@ -73,44 +72,63 @@ class TransfermarktScraper:
         table = soup.find("table", {"class": "items"})
         records: list[dict] = []
 
-        if table:
-            rows = table.find_all("tr")
-            for row in rows[1:]:  # skip header
-                tds = row.find_all("td")
-                if len(tds) < 5:
-                    continue
-                date_text = self._clean_text(tds[1].get_text())
-                home_team = self._clean_text(tds[2].get_text())
-                away_team = self._clean_text(tds[3].get_text())
-                result_text = self._clean_text(tds[4].get_text())
-                attendance_text = self._clean_text(tds[5].get_text()) if len(tds) > 5 else None
-                venue_text = self._clean_text(tds[6].get_text()) if len(tds) > 6 else None
+        if not table:
+            return records
 
-                if not home_team or not away_team or not result_text or ":" not in result_text:
-                    continue
-
-                home_goals, away_goals = self._parse_score(result_text)
-                match_date = self._parse_date(date_text, season_start_year)
-                if match_date is None:
-                    continue
-
-                records.append(
-                    {
-                        "season": f"{season_start_year}/{season_start_year + 1}",
-                        "season_start_year": season_start_year,
-                        "league_key": self._league_key(league),
-                        "league_name": league.name,
-                        "country": league.country,
-                        "match_date": match_date.isoformat(),
-                        "home_team": home_team,
-                        "away_team": away_team,
-                        "home_goals": home_goals,
-                        "away_goals": away_goals,
-                        "attendance": self._to_int(attendance_text) if attendance_text else None,
-                        "stadium": venue_text,
-                    }
-                )
+        for row in table.select("tbody tr"):
+            row_data = self._extract_match_row_data(row, season_start_year)
+            if row_data is None:
+                continue
+            home_team, away_team, home_goals, away_goals, match_date, attendance, stadium = row_data
+            records.append(
+                {
+                    "season": f"{season_start_year}/{season_start_year + 1}",
+                    "season_start_year": season_start_year,
+                    "league_key": self._league_key(league),
+                    "league_name": league.name,
+                    "country": league.country,
+                    "match_date": match_date.isoformat(),
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_goals": home_goals,
+                    "away_goals": away_goals,
+                    "attendance": attendance,
+                    "stadium": stadium,
+                }
+            )
         return records
+
+    def _extract_match_row_data(self, row: BeautifulSoup, season_start_year: int) -> tuple[str, str, int, int, datetime, int | None, str | None] | None:
+        text_cells = [self._clean_text(td.get_text(" ", strip=True)) for td in row.find_all("td")]
+        clean_cells = [cell for cell in text_cells if cell]
+        if not clean_cells:
+            return None
+
+        result_text = next((cell for cell in clean_cells if re.search(r"\d+\s*:\s*\d+", cell)), None)
+        if result_text is None:
+            return None
+
+        team_links = []
+        for link in row.select("a[href*='/verein/']"):
+            name = self._clean_text(link.get_text(" ", strip=True))
+            if name and name not in team_links:
+                team_links.append(name)
+        if len(team_links) < 2:
+            return None
+        home_team, away_team = team_links[0], team_links[1]
+
+        match_date = None
+        for cell in clean_cells:
+            match_date = self._parse_date(cell, season_start_year)
+            if match_date is not None:
+                break
+        if match_date is None:
+            return None
+
+        home_goals, away_goals = self._parse_score(result_text)
+        attendance = self._extract_attendance(clean_cells)
+        stadium = self._extract_stadium(row)
+        return home_team, away_team, home_goals, away_goals, match_date, attendance, stadium
 
     def scrape_team_context(self, league: League, season_start_year: int) -> list[dict]:
         soup = self.soup(league.competition_url, params={"saison_id": season_start_year})
@@ -226,7 +244,7 @@ class TransfermarktScraper:
         if value is None:
             return None
         text = str(value).strip()
-        for fmt in ("%b %d, %Y", "%d/%m/%Y", "%d.%m.%Y", "%d %b %Y"):
+        for fmt in ("%a, %b %d, %Y", "%b %d, %Y", "%d/%m/%Y", "%d.%m.%Y", "%d %b %Y"):
             try:
                 return datetime.strptime(text, fmt)
             except ValueError:
@@ -261,6 +279,27 @@ class TransfermarktScraper:
         if unit in {"k", "th."}:
             return amount * 1_000
         return amount
+
+    @staticmethod
+    def _extract_attendance(values: list[str]) -> int | None:
+        candidates = []
+        for value in values:
+            if ":" in value or "/" in value or "." in value and not re.search(r"\d{1,2}\.\d{1,2}\.\d{2,4}", value):
+                continue
+            parsed = TransfermarktScraper._to_int(value)
+            if parsed and parsed >= 1_000:
+                candidates.append(parsed)
+        return max(candidates) if candidates else None
+
+    @staticmethod
+    def _extract_stadium(row: BeautifulSoup) -> str | None:
+        venue_link = row.select_one("a[href*='/stadion/']")
+        if venue_link:
+            return TransfermarktScraper._clean_text(venue_link.get_text(" ", strip=True))
+        title_link = row.select_one("a[title*='Stadium'], a[title*='Arena']")
+        if title_link:
+            return TransfermarktScraper._clean_text(title_link.get("title"))
+        return None
 
 
 def season_years(window: int, end_year: int | None) -> list[int]:
@@ -297,11 +336,46 @@ def main() -> None:
             try:
                 all_matches.extend(scraper.scrape_matches(league, season_start_year))
                 all_team_context.extend(scraper.scrape_team_context(league, season_start_year))
-            except requests.HTTPError as exc:
+            except requests.RequestException as exc:
                 print(f"Skipping {league.name} {season_start_year}: {exc}")
 
-    matches_df = pd.DataFrame(all_matches).drop_duplicates()
-    team_df = pd.DataFrame(all_team_context).drop_duplicates(subset=["season", "team_name", "league_key"])
+    match_columns = [
+        "season",
+        "season_start_year",
+        "league_key",
+        "league_name",
+        "country",
+        "match_date",
+        "home_team",
+        "away_team",
+        "home_goals",
+        "away_goals",
+        "attendance",
+        "stadium",
+    ]
+    team_columns = [
+        "season",
+        "season_start_year",
+        "league_key",
+        "team_name",
+        "squad_market_value_eur",
+        "top_players",
+        "injured_players",
+        "injured_top_player_count",
+        "stadium_capacity",
+    ]
+
+    matches_df = pd.DataFrame(all_matches)
+    if matches_df.empty:
+        matches_df = pd.DataFrame(columns=match_columns)
+    else:
+        matches_df = matches_df[match_columns].drop_duplicates()
+
+    team_df = pd.DataFrame(all_team_context)
+    if team_df.empty:
+        team_df = pd.DataFrame(columns=team_columns)
+    else:
+        team_df = team_df[team_columns].drop_duplicates(subset=["season", "team_name", "league_key"])
 
     matches_path = out_dir / "matches.csv"
     team_path = out_dir / "team_context.csv"
