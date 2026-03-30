@@ -196,6 +196,28 @@ def main() -> None:
     dataset = dataset.merge(home_context, on=["season", "league_key", "home_team"], how="left")
     dataset = dataset.merge(away_context, on=["season", "league_key", "away_team"], how="left")
 
+    home_mismatch_mask = (
+        dataset["home_data_reference_season"].notna() & (dataset["season"] != dataset["home_data_reference_season"])
+    )
+    away_mismatch_mask = (
+        dataset["away_data_reference_season"].notna() & (dataset["season"] != dataset["away_data_reference_season"])
+    )
+    season_mismatch_rows = dataset[home_mismatch_mask | away_mismatch_mask].copy()
+    if not season_mismatch_rows.empty:
+        mismatch_summary = (
+            season_mismatch_rows.groupby(["season", "league_key"], dropna=False)
+            .size()
+            .reset_index(name="mismatch_rows")
+            .sort_values(["season", "league_key"])
+        )
+        print(
+            "WARNING: season-context mismatch detected "
+            f"(home={int(home_mismatch_mask.sum())}, away={int(away_mismatch_mask.sum())}, total={len(season_mismatch_rows)})."
+        )
+        print(mismatch_summary.to_string(index=False))
+    else:
+        print("Season-context consistency check passed: no mismatched rows after merge.")
+
     dataset["attendance_ratio"] = dataset["attendance"] / dataset["home_stadium_capacity"].replace({0: np.nan})
     dataset["home_squad_value_diff"] = dataset["home_squad_market_value_eur"] - dataset["away_squad_market_value_eur"]
     dataset["home_top_player_value_diff"] = dataset["home_top_player_total_value_eur"] - dataset["away_top_player_total_value_eur"]
