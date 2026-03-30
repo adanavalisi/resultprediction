@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -65,7 +66,26 @@ class TransfermarktScraper:
     def soup(self, url: str, params: dict | None = None) -> BeautifulSoup:
         return BeautifulSoup(self.fetch_html(url, params=params), "lxml")
 
-    def scrape_matches(self, league: League, season_start_year: int) -> list[dict]:
+    @staticmethod
+    def _detect_reason_code(table: BeautifulSoup | None, row_count: int, html: str) -> str | None:
+        if table is not None and row_count > 0:
+            return None
+        lowered = html.lower()
+        blocked_markers = [
+            "captcha",
+            "cloudflare",
+            "access denied",
+            "forbidden",
+            "too many requests",
+            "bot",
+        ]
+        if any(marker in lowered for marker in blocked_markers):
+            return "blocked"
+        if table is None:
+            return "selector_miss"
+        return "no_data"
+
+    def scrape_matches(self, league: League, season_start_year: int) -> tuple[list[dict], str | None]:
         url = f"{BASE_URL}/{league.slug}/gesamtspielplan/wettbewerb/{league.code}"
         html = self.fetch_html(url, params={"saison_id": season_start_year})
         soup = BeautifulSoup(html, "lxml")
@@ -73,7 +93,7 @@ class TransfermarktScraper:
         records: list[dict] = []
 
         if not table:
-            return records
+            return records, self._detect_reason_code(table, 0, html)
 
         for row in table.select("tbody tr"):
             row_data = self._extract_match_row_data(row, season_start_year)
@@ -96,7 +116,7 @@ class TransfermarktScraper:
                     "stadium": stadium,
                 }
             )
-        return records
+        return records, self._detect_reason_code(table, len(records), html)
 
     def _extract_match_row_data(self, row: BeautifulSoup, season_start_year: int) -> tuple[str, str, int, int, datetime, int | None, str | None] | None:
         text_cells = [self._clean_text(td.get_text(" ", strip=True)) for td in row.find_all("td")]
@@ -130,8 +150,10 @@ class TransfermarktScraper:
         stadium = self._extract_stadium(row)
         return home_team, away_team, home_goals, away_goals, match_date, attendance, stadium
 
-    def scrape_team_context(self, league: League, season_start_year: int) -> list[dict]:
-        soup = self.soup(league.competition_url, params={"saison_id": season_start_year})
+    def scrape_team_context(self, league: League, season_start_year: int) -> tuple[list[dict], str | None]:
+        html = self.fetch_html(league.competition_url, params={"saison_id": season_start_year})
+        soup = BeautifulSoup(html, "lxml")
+        table = soup.find("table", {"class": "items"})
         links = soup.select("td.hauptlink a[title]")
         team_pages: dict[str, str] = {}
         for link in links:
@@ -144,7 +166,7 @@ class TransfermarktScraper:
         contexts: list[dict] = []
         for team_name, team_url in tqdm(team_pages.items(), desc=f"{league.name} squads", leave=False):
             contexts.append(self._scrape_single_team_context(league, season_start_year, team_name, team_url))
-        return contexts
+        return contexts, self._detect_reason_code(table, len(contexts), html)
 
     def _scrape_single_team_context(
         self,
@@ -328,16 +350,91 @@ def main() -> None:
     seasons = season_years(args.seasons, args.end_season)
     all_matches: list[dict] = []
     all_team_context: list[dict] = []
+    rows_per_league_season: list[dict] = []
+    errors: list[dict] = []
+    warnings: list[dict] = []
+
+    min_match_rows = 100
+    min_team_rows = 10
 
     for league_key in args.leagues:
         league = LEAGUES[league_key]
         for season_start_year in seasons:
             print(f"Scraping {league.name} {season_start_year}/{season_start_year + 1}")
+            season_label = f"{season_start_year}/{season_start_year + 1}"
             try:
-                all_matches.extend(scraper.scrape_matches(league, season_start_year))
-                all_team_context.extend(scraper.scrape_team_context(league, season_start_year))
+                match_records, match_reason = scraper.scrape_matches(league, season_start_year)
+                team_context_records, team_reason = scraper.scrape_team_context(league, season_start_year)
+
+                all_matches.extend(match_records)
+                all_team_context.extend(team_context_records)
+
+                rows_per_league_season.append(
+                    {
+                        "league_key": league_key,
+                        "league_name": league.name,
+                        "season": season_label,
+                        "matches": len(match_records),
+                        "team_context": len(team_context_records),
+                    }
+                )
+
+                if match_reason is not None:
+                    errors.append(
+                        {
+                            "type": "matches_scrape_validation",
+                            "league_key": league_key,
+                            "season": season_label,
+                            "reason_code": match_reason,
+                            "rows": len(match_records),
+                        }
+                    )
+
+                if team_reason is not None:
+                    errors.append(
+                        {
+                            "type": "team_context_scrape_validation",
+                            "league_key": league_key,
+                            "season": season_label,
+                            "reason_code": team_reason,
+                            "rows": len(team_context_records),
+                        }
+                    )
+
+                if len(match_records) < min_match_rows:
+                    errors.append(
+                        {
+                            "type": "threshold_breach",
+                            "dataset": "matches",
+                            "league_key": league_key,
+                            "season": season_label,
+                            "minimum_required": min_match_rows,
+                            "actual": len(match_records),
+                            "reason_code": "min_rows_not_met",
+                        }
+                    )
+                if len(team_context_records) < min_team_rows:
+                    errors.append(
+                        {
+                            "type": "threshold_breach",
+                            "dataset": "team_context",
+                            "league_key": league_key,
+                            "season": season_label,
+                            "minimum_required": min_team_rows,
+                            "actual": len(team_context_records),
+                            "reason_code": "min_rows_not_met",
+                        }
+                    )
             except requests.RequestException as exc:
-                print(f"Skipping {league.name} {season_start_year}: {exc}")
+                errors.append(
+                    {
+                        "type": "request_exception",
+                        "league_key": league_key,
+                        "season": season_label,
+                        "reason_code": "request_exception",
+                        "message": str(exc),
+                    }
+                )
 
     match_columns = [
         "season",
@@ -391,6 +488,9 @@ def main() -> None:
                 "season_start_years": seasons,
                 "match_rows": len(matches_df),
                 "team_rows": len(team_df),
+                "rows_per_league_season": rows_per_league_season,
+                "errors": errors,
+                "warnings": warnings,
             },
             indent=2,
         ),
@@ -400,6 +500,9 @@ def main() -> None:
     print(f"Wrote {matches_path}")
     print(f"Wrote {team_path}")
     print(f"Wrote {metadata_path}")
+
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
