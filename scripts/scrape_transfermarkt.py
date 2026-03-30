@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 import time
@@ -12,8 +13,10 @@ from urllib.parse import urljoin
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+from urllib3.util.retry import Retry
 
 BASE_URL = "https://www.transfermarkt.com"
 DEFAULT_HEADERS = {
@@ -52,19 +55,118 @@ LEAGUES: dict[str, League] = {
 
 
 class TransfermarktScraper:
-    def __init__(self, delay: float = 3.0) -> None:
+    def __init__(
+        self,
+        delay: float = 3.0,
+        timeout: float = 120.0,
+        max_retries: int = 3,
+        backoff_base: float = 2.0,
+        debug_dir: str | Path = "data/raw/debug",
+    ) -> None:
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
         self.delay = delay
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
+        self.debug_dir = Path(debug_dir)
 
-    def fetch_html(self, url: str, params: dict | None = None) -> str:
-        response = self.session.get(url, params=params, timeout=120)
-        response.raise_for_status()
-        time.sleep(self.delay)
-        return response.text
+        retry_strategy = Retry(
+            total=max_retries,
+            connect=max_retries,
+            read=max_retries,
+            status=max_retries,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "HEAD"}),
+            backoff_factor=0,
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def fetch_html(
+        self,
+        url: str,
+        params: dict | None = None,
+        *,
+        expected_selector: str | None = None,
+        league_key: str | None = None,
+        season_start_year: int | None = None,
+    ) -> str:
+        last_error: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.get(url, params=params, timeout=self.timeout)
+                response.raise_for_status()
+                html = response.text
+                bot_reason = self._detect_bot_signature(html, expected_selector=expected_selector)
+                if bot_reason is not None:
+                    self._save_debug_snapshot(
+                        html=html,
+                        league_key=league_key,
+                        season_start_year=season_start_year,
+                        reason=bot_reason,
+                        url=url,
+                    )
+                    raise RuntimeError(f"Bot/CAPTCHA signature detected: {bot_reason}")
+                time.sleep(self.delay)
+                return html
+            except (requests.RequestException, RuntimeError) as exc:
+                last_error = exc
+                if attempt >= self.max_retries:
+                    break
+                sleep_time = self._calculate_backoff(attempt)
+                time.sleep(sleep_time)
+        raise requests.RequestException(f"Failed to fetch {url} after {self.max_retries + 1} attempts: {last_error}")
 
     def soup(self, url: str, params: dict | None = None) -> BeautifulSoup:
         return BeautifulSoup(self.fetch_html(url, params=params), "lxml")
+
+    @staticmethod
+    def _detect_bot_signature(html: str, expected_selector: str | None = None) -> str | None:
+        lowered = html.lower()
+        blocked_markers = [
+            "captcha",
+            "access denied",
+            "too many requests",
+            "cloudflare",
+            "forbidden",
+            "verify you are human",
+        ]
+        for marker in blocked_markers:
+            if marker in lowered:
+                return f"marker_{marker.replace(' ', '_')}"
+        if expected_selector:
+            soup = BeautifulSoup(html, "lxml")
+            if soup.select_one(expected_selector) is None:
+                return "missing_expected_selector"
+        return None
+
+    def _calculate_backoff(self, attempt: int) -> float:
+        jitter = random.uniform(0, self.delay)
+        return self.delay * (self.backoff_base**attempt) + jitter
+
+    def _save_debug_snapshot(
+        self,
+        *,
+        html: str,
+        league_key: str | None,
+        season_start_year: int | None,
+        reason: str,
+        url: str,
+    ) -> None:
+        league_label = league_key or "unknown_league"
+        if season_start_year is not None:
+            season_label = f"{season_start_year}_{season_start_year + 1}"
+        else:
+            season_label = "unknown_season"
+        snapshot_dir = self.debug_dir / league_label / season_label
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        snapshot_path = snapshot_dir / f"{reason}_{ts}.html"
+        snapshot_path.write_text(f"<!-- url: {url} -->\n{html}", encoding="utf-8")
 
     @staticmethod
     def _detect_reason_code(table: BeautifulSoup | None, row_count: int, html: str) -> str | None:
@@ -87,7 +189,13 @@ class TransfermarktScraper:
 
     def scrape_matches(self, league: League, season_start_year: int) -> tuple[list[dict], str | None]:
         url = f"{BASE_URL}/{league.slug}/gesamtspielplan/wettbewerb/{league.code}"
-        html = self.fetch_html(url, params={"saison_id": season_start_year})
+        html = self.fetch_html(
+            url,
+            params={"saison_id": season_start_year},
+            expected_selector="table.items",
+            league_key=self._league_key(league),
+            season_start_year=season_start_year,
+        )
         soup = BeautifulSoup(html, "lxml")
         table = soup.find("table", {"class": "items"})
         records: list[dict] = []
@@ -151,7 +259,14 @@ class TransfermarktScraper:
         return home_team, away_team, home_goals, away_goals, match_date, attendance, stadium
 
     def scrape_team_context(self, league: League, season_start_year: int) -> tuple[list[dict], str | None]:
-        html = self.fetch_html(league.competition_url, params={"saison_id": season_start_year})
+        league_key = self._league_key(league)
+        html = self.fetch_html(
+            league.competition_url,
+            params={"saison_id": season_start_year},
+            expected_selector="table.items",
+            league_key=league_key,
+            season_start_year=season_start_year,
+        )
         soup = BeautifulSoup(html, "lxml")
         table = soup.find("table", {"class": "items"})
         links = soup.select("td.hauptlink a[title]")
@@ -165,7 +280,15 @@ class TransfermarktScraper:
 
         contexts: list[dict] = []
         for team_name, team_url in tqdm(team_pages.items(), desc=f"{league.name} squads", leave=False):
-            contexts.append(self._scrape_single_team_context(league, season_start_year, team_name, team_url))
+            contexts.append(
+                self._scrape_single_team_context(
+                    league,
+                    season_start_year,
+                    team_name,
+                    team_url,
+                    league_key=league_key,
+                )
+            )
         return contexts, self._detect_reason_code(table, len(contexts), html)
 
     def _scrape_single_team_context(
@@ -174,14 +297,39 @@ class TransfermarktScraper:
         season_start_year: int,
         team_name: str,
         team_url: str,
+        league_key: str,
     ) -> dict:
         squad_url = team_url.replace("/startseite/", "/kader/") if "/startseite/" in team_url else team_url
         injuries_url = team_url.replace("/startseite/", "/verletzungen/") if "/startseite/" in team_url else team_url
         venue_url = team_url.replace("/startseite/", "/stadion/") if "/startseite/" in team_url else team_url
 
-        squad_soup = self.soup(squad_url, params={"saison_id": season_start_year})
-        injuries_soup = self.soup(injuries_url)
-        venue_soup = self.soup(venue_url)
+        squad_soup = BeautifulSoup(
+            self.fetch_html(
+                squad_url,
+                params={"saison_id": season_start_year},
+                expected_selector="table.items",
+                league_key=league_key,
+                season_start_year=season_start_year,
+            ),
+            "lxml",
+        )
+        injuries_soup = BeautifulSoup(
+            self.fetch_html(
+                injuries_url,
+                expected_selector="table.items",
+                league_key=league_key,
+                season_start_year=season_start_year,
+            ),
+            "lxml",
+        )
+        venue_soup = BeautifulSoup(
+            self.fetch_html(
+                venue_url,
+                league_key=league_key,
+                season_start_year=season_start_year,
+            ),
+            "lxml",
+        )
 
         top_players = self._extract_top_players(squad_soup, limit=5)
         injured_players = self._extract_injuries(injuries_soup)
@@ -338,6 +486,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seasons", type=int, default=5)
     parser.add_argument("--end-season", type=int, default=None)
     parser.add_argument("--delay", type=float, default=1.0)
+    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--backoff-base", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -346,7 +497,12 @@ def main() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    scraper = TransfermarktScraper(delay=args.delay)
+    scraper = TransfermarktScraper(
+        delay=args.delay,
+        timeout=args.timeout,
+        max_retries=args.max_retries,
+        backoff_base=args.backoff_base,
+    )
     seasons = season_years(args.seasons, args.end_season)
     all_matches: list[dict] = []
     all_team_context: list[dict] = []
