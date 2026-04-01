@@ -1,11 +1,11 @@
 # resultprediction
 
-Bu repo, Transfermarkt verilerini kullanarak futbol mac sonucu icin `1-X-2` tahmin modeli ureten temel bir Python boru hatti sunar.
+Bu repo, API-Football verilerini kullanarak futbol mac sonucu icin `1-X-2` tahmin modeli ureten temel bir Python boru hatti sunar.
 
 Akis:
 
 1. `scripts/scrape_transfermarkt.py`
-   Transfermarkt uzerinden 9 lig ve son 5 sezon icin mac sonuclari ile takim baglam verilerini toplar.
+   API-Football uzerinden 9 lig ve son 5 sezon icin mac sonuclari ile takim baglam verilerini toplar.
 2. `scripts/prepare_dataset.py`
    Ham veriyi ozelliklere donusturur ve egitim veri setini uretir.
 3. `scripts/train_dnn.py`
@@ -60,7 +60,7 @@ On kosul:
 ## 1. Veri cekme
 
 ```bash
-python scripts/scrape_transfermarkt.py --output-dir data/raw --seasons 5
+python scripts/scrape_transfermarkt.py --output-dir data/raw --seasons 5 --api-key <API_FOOTBALL_KEY>
 ```
 
 Uretilen dosyalar:
@@ -75,24 +75,16 @@ Toplanan alanlar:
 - Ev sahibi ve deplasman takimlari
 - Gol sayilari
 - Seyirci sayisi ve stadyum bilgisi
-- Takim kadro degeri
-- Ilk 5 en degerli oyuncu
-- Sakat oyuncu listesi
-- Stadyum kapasitesi
+- Takim stadyum kapasitesi
+- API kapsaminda mevcut oldugu kadar seyirci ve stadyum bilgisi
+- API kaynakli eksik alanlar icin guvenli bos degerler
 
 Not:
 
-- Transfermarkt HTML yapisi degisebildigi icin seciciler zaman zaman guncellenebilir.
-- Site rate-limit veya bot korumasi uygulayabilir. Gerekirse `--delay 2.0` gibi daha yuksek gecikme kullanin.
-- Tarihsel "ilk 11" bilgisini Transfermarkt mac raporlarindan cekmek isterseniz scraping modulu bu yonde genisletilmeye uygundur, ancak ilk surum mevcut haliyle kadro degeri, ust duzey oyuncu ve sakatlik etkisini takim/sezon baglaminda toplar.
-
-Yeni dogrulama/fail kosullari:
-
-- `scrape_matches` ve `scrape_team_context`, lig+sezon bazinda tablo veya satir sorunlarini `selector_miss`, `blocked`, `no_data` reason code'lariyla `scrape_metadata.json` icindeki `errors[]` alanina yazar.
-- Lig+sezon esik kontrolleri uygulanir (`matches >= 100`, `team_context >= 10`). Esik alti durumlar artik sadece stdout'a yazilmaz; `errors[]` icine `threshold_breach` olarak kaydedilir.
-- Her lig+sezon icin satir sayilari `rows_per_league_season` alaninda tutulur.
-- Betik sonunda `errors[]` bos degilse islem `non-zero exit code` ile biter. Bu durum CI veya otomasyon tarafinda "veri kalitesi/fetch sorunu" olarak yorumlanmalidir.
-- `warnings[]` alani bilgilendirici ama kritik olmayan durumlar icin ayrilmistir (su an bos gelebilir).
+- API anahtari zorunludur. `--api-key` ile verebilir veya `API_FOOTBALL_KEY` environment variable'ina koyabilirsiniz.
+- API rate-limit uyguladigi icin gecikme ve timeout degerlerini `--delay` ve `--timeout` ile ayarlayabilirsiniz.
+- `scrape_metadata.json` dosyasi, lig/sezon bazli satir sayilari ile API hatalarini `errors[]` alaninda raporlar.
+- API-Football, Transfermarkt'taki piyasa degeri/oyuncu degeri gibi alanlari dogrudan saglamadigi icin bu alanlar bos degerle yazilir.
 
 ## 2. Veri hazirlama
 
@@ -150,4 +142,4 @@ Kaydedilen ciktilar:
 
 - Zaman sizmasini azaltmak icin egitim / dogrulama / test ayrimi sezon bazli yapilir.
 - Model, `softmax` cikis katmani ile yuzdelik olasilik uretir.
-- Bu repo bir ilk surum iskeletidir. Transfermarkt sayfa yapisina gore secicilerde ince ayar gerekebilir.
+- Bu repo bir ilk surum iskeletidir. API kapsami ve plan limitlerine gore veri derinligi degisebilir.
