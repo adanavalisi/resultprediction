@@ -249,7 +249,7 @@ def main() -> None:
 
     matches_path = out_dir / "matches.csv"
     team_path = out_dir / "team_context.csv"
-    metadata_path = out_dir / "scrape_metadata.json"
+    metadata_path = out_dir / "api_football_metadata.json"
 
     matches_df.to_csv(matches_path, index=False)
     team_df.to_csv(team_path, index=False)

@@ -4,7 +4,7 @@ Bu repo, API-Football verilerini kullanarak futbol mac sonucu icin `1-X-2` tahmi
 
 Akis:
 
-1. `scripts/scrape_transfermarkt.py`
+1. `scripts/fetch_api_football.py`
    API-Football uzerinden 9 lig ve son 5 sezon icin mac sonuclari ile takim baglam verilerini toplar.
 2. `scripts/prepare_dataset.py`
    Ham veriyi ozelliklere donusturur ve egitim veri setini uretir.
@@ -60,14 +60,14 @@ On kosul:
 ## 1. Veri cekme
 
 ```bash
-python scripts/scrape_transfermarkt.py --output-dir data/raw --seasons 5 --api-key <API_FOOTBALL_KEY>
+python scripts/fetch_api_football.py --output-dir data/raw --seasons 5 --api-key <API_FOOTBALL_KEY>
 ```
 
 Uretilen dosyalar:
 
 - `data/raw/matches.csv`
 - `data/raw/team_context.csv`
-- `data/raw/scrape_metadata.json`
+- `data/raw/api_football_metadata.json`
 
 Toplanan alanlar:
 
@@ -83,8 +83,8 @@ Not:
 
 - API anahtari zorunludur. `--api-key` ile verebilir veya `API_FOOTBALL_KEY` environment variable'ina koyabilirsiniz.
 - API rate-limit uyguladigi icin gecikme ve timeout degerlerini `--delay` ve `--timeout` ile ayarlayabilirsiniz.
-- `scrape_metadata.json` dosyasi, lig/sezon bazli satir sayilari ile API hatalarini `errors[]` alaninda raporlar.
-- API-Football, Transfermarkt'taki piyasa degeri/oyuncu degeri gibi alanlari dogrudan saglamadigi icin bu alanlar bos degerle yazilir.
+- `api_football_metadata.json` dosyasi, lig/sezon bazli satir sayilari ile API hatalarini `errors[]` alaninda raporlar.
+- API-Football planina bagli olarak piyasa degeri/oyuncu degeri gibi alanlar her zaman mevcut olmayabilir; bu alanlar model uyumlulugu icin guvenli bos degerlerle yazilir.
 
 ## 2. Veri hazirlama
 
