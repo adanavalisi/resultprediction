@@ -1,16 +1,18 @@
 # resultprediction
 
-Bu repo, API-Football verilerini kullanarak futbol mac sonucu icin `1-X-2` tahmin modeli ureten temel bir Python boru hatti sunar.
+Bu repo, openfootball tarihsel veri seti ile modeli egitip API-Football ile gunluk/anlik fikstur tahmini ureten bir Python boru hatti sunar.
 
 Akis:
 
-1. `scripts/scrape_transfermarkt.py`
-   API-Football uzerinden 9 lig ve son 5 sezon icin mac sonuclari ile takim baglam verilerini toplar.
+1. `scripts/ingest_openfootball.py`
+   openfootball/football.json veri tabanindan tarihsel mac verilerini `data/raw` altina indirir.
 2. `scripts/prepare_dataset.py`
    Ham veriyi ozelliklere donusturur ve egitim veri setini uretir.
 3. `scripts/train_dnn.py`
    DNN modeli egitir ve ev sahibi galibiyeti, beraberlik, deplasman galibiyeti olasiliklarini verir.
-4. `app.py`
+4. `scripts/predict_live_fixtures.py`
+   API-Football'dan belirli bir tarihteki fiksturleri alip egitilmis modelle anlik tahmin uretir.
+5. `app.py`
    Streamlit tabanli web arayuzu ile secilen iki takim icin tahmin olasiliklarini grafik halinde gosterir.
 
 Desteklenen ligler:
@@ -57,17 +59,17 @@ On kosul:
 - `models/football_outcome_dnn.keras`
 - `models/feature_scaler.joblib`
 
-## 1. Veri cekme
+## 1. Egitim icin openfootball veri cekme
 
 ```bash
-python scripts/scrape_transfermarkt.py --output-dir data/raw --seasons 5 --api-key <API_FOOTBALL_KEY>
+python scripts/ingest_openfootball.py --output-dir data/raw --seasons 8
 ```
 
 Uretilen dosyalar:
 
 - `data/raw/matches.csv`
 - `data/raw/team_context.csv`
-- `data/raw/scrape_metadata.json`
+- `data/raw/openfootball_metadata.json`
 
 Toplanan alanlar:
 
@@ -76,15 +78,14 @@ Toplanan alanlar:
 - Gol sayilari
 - Seyirci sayisi ve stadyum bilgisi
 - Takim stadyum kapasitesi
-- API kapsaminda mevcut oldugu kadar seyirci ve stadyum bilgisi
-- API kaynakli eksik alanlar icin guvenli bos degerler
+- openfootball kapsaminda mevcut oldugu kadar mac sonucu ve tarih bilgisi
+- Eksik baglam alanlari (seyirci, stadyum, piyasa degeri) icin guvenli bos degerler
 
 Not:
 
-- API anahtari zorunludur. `--api-key` ile verebilir veya `API_FOOTBALL_KEY` environment variable'ina koyabilirsiniz.
-- API rate-limit uyguladigi icin gecikme ve timeout degerlerini `--delay` ve `--timeout` ile ayarlayabilirsiniz.
-- `scrape_metadata.json` dosyasi, lig/sezon bazli satir sayilari ile API hatalarini `errors[]` alaninda raporlar.
-- API-Football, Transfermarkt'taki piyasa degeri/oyuncu degeri gibi alanlari dogrudan saglamadigi icin bu alanlar bos degerle yazilir.
+- openfootball cekiminde API anahtari gerekmez.
+- `openfootball_metadata.json` dosyasi, indirilen URL'leri ve hata kayitlarini `errors[]` alaninda raporlar.
+- openfootball veri setinde piyasa degeri/sakat oyuncu alanlari olmadigi icin bu alanlar model uyumlulugu adina bos degerlerle uretilir.
 
 ## 2. Veri hazirlama
 
@@ -137,6 +138,21 @@ Kaydedilen ciktilar:
 - `1`: Ev sahibi galibiyeti
 - `X`: Beraberlik
 - `2`: Deplasman galibiyeti
+
+
+## 4. API-Football ile gunluk/anlik fikstur tahmini
+
+Model egitildikten sonra secilen lig ve tarihteki fiksturler icin tahmin alabilirsiniz:
+
+```bash
+python scripts/predict_live_fixtures.py --league "Premier League" --date 2026-04-06 --api-key <API_FOOTBALL_KEY>
+```
+
+Cikti: `data/predictions/live_predictions.json`
+
+Notlar:
+- Bu adim API anahtari gerektirir (`--api-key` veya `API_FOOTBALL_KEY`).
+- API'den gelen takim isimleri egitim verisindeki takim isimleriyle birebir eslesmelidir.
 
 ## Teknik notlar
 

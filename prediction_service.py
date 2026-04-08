@@ -3,11 +3,13 @@ from __future__ import annotations
 import ast
 import json
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 import tensorflow as tf
 
 
@@ -19,6 +21,19 @@ class PredictionArtifacts:
     team_context: pd.DataFrame
     training_dataset: pd.DataFrame
     feature_columns: list[str]
+
+
+API_LEAGUE_IDS: dict[str, int] = {
+    "super_lig": 203,
+    "premier_league": 39,
+    "bundesliga": 78,
+    "laliga": 140,
+    "serie_a": 135,
+    "ligue_1": 61,
+    "liga_portugal": 94,
+    "jupiler_pro_league": 144,
+    "eredivisie": 88,
+}
 
 
 class MatchPredictor:
@@ -106,6 +121,69 @@ class MatchPredictor:
             "feature_row": feature_row,
         }
 
+    def predict_live_fixtures(
+        self,
+        league_name: str,
+        api_key: str,
+        match_date: str | None = None,
+    ) -> list[dict]:
+        league_key = self._league_key_from_name(league_name)
+        league_id = API_LEAGUE_IDS.get(league_key)
+        if league_id is None:
+            raise ValueError(f"API-Football mapping not found for league '{league_name}' ({league_key}).")
+
+        if match_date is None:
+            match_date = date.today().isoformat()
+
+        fixtures = self._fetch_live_fixtures(league_id=league_id, match_date=match_date, api_key=api_key)
+        predictions: list[dict] = []
+        skipped: list[dict] = []
+        known_teams = set(self.teams_for_league(league_name))
+
+        for item in fixtures:
+            fixture = item.get("fixture") or {}
+            teams = item.get("teams") or {}
+            home_team = (teams.get("home") or {}).get("name")
+            away_team = (teams.get("away") or {}).get("name")
+            status_short = ((fixture.get("status") or {}).get("short")) or ""
+            fixture_date = fixture.get("date")
+
+            if not home_team or not away_team:
+                continue
+
+            if home_team not in known_teams or away_team not in known_teams:
+                skipped.append(
+                    {
+                        "home_team": home_team,
+                        "away_team": away_team,
+                        "reason": "team_not_in_training_data",
+                    }
+                )
+                continue
+
+            if home_team == away_team:
+                skipped.append(
+                    {
+                        "home_team": home_team,
+                        "away_team": away_team,
+                        "reason": "same_team",
+                    }
+                )
+                continue
+
+            prediction = self.predict_match(league_name=league_name, home_team=home_team, away_team=away_team)
+            prediction["fixture_date"] = fixture_date
+            prediction["fixture_status"] = status_short
+            predictions.append(prediction)
+
+        if not predictions and skipped:
+            raise ValueError(
+                "No fixtures could be predicted with current training data. "
+                f"Skipped fixtures: {len(skipped)} (sample={skipped[:3]})."
+            )
+
+        return predictions
+
     def _load(self) -> PredictionArtifacts:
         matches_path = self.raw_dir / "matches.csv"
         context_path = self.raw_dir / "team_context.csv"
@@ -121,7 +199,7 @@ class MatchPredictor:
         ]
         if missing:
             raise FileNotFoundError(
-                "Missing required artifacts. Run scraping, dataset preparation and training first: "
+                "Missing required artifacts. Run data ingestion, dataset preparation and training first: "
                 + ", ".join(missing)
             )
 
@@ -154,6 +232,17 @@ class MatchPredictor:
             training_dataset=training_dataset,
             feature_columns=feature_columns,
         )
+
+    def _fetch_live_fixtures(self, league_id: int, match_date: str, api_key: str) -> list[dict]:
+        response = requests.get(
+            "https://v3.football.api-sports.io/fixtures",
+            params={"league": league_id, "date": match_date},
+            headers={"x-apisports-key": api_key, "Accept": "application/json"},
+            timeout=45,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("response", [])
 
     def _league_key_from_name(self, league_name: str) -> str:
         match = self.artifacts.matches.loc[self.artifacts.matches["league_name"] == league_name, "league_key"]

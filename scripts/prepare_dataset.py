@@ -152,13 +152,13 @@ def main() -> None:
         matches = pd.read_csv(raw_dir / "matches.csv")
     except EmptyDataError as exc:
         raise ValueError(
-            "matches.csv has no usable columns/rows. First fix raw data fetch (scripts/scrape_transfermarkt.py) and rerun it."
+            "matches.csv has no usable columns/rows. First fix raw data fetch (scripts/fetch_api_football.py) and rerun it."
         ) from exc
     team_context = pd.read_csv(raw_dir / "team_context.csv")
 
     if matches.empty:
         raise ValueError(
-            "matches.csv is empty. First fix the raw data fetch step (scripts/scrape_transfermarkt.py) and rerun fetching."
+            "matches.csv is empty. First fix the raw data fetch step (scripts/fetch_api_football.py) and rerun fetching."
         )
 
     matches["match_date"] = pd.to_datetime(matches["match_date"], utc=False)
